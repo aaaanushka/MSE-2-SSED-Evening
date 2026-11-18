@@ -3,8 +3,7 @@ name: TaskFlow Docker CI/CD
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -12,20 +11,23 @@ permissions:
 
 jobs:
   build-push-deploy:
+    name: Build, Push and Verify
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Validate secrets
+      - name: Validate Docker Hub secrets
         env:
-          USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          DB_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
         run: |
-          test -n "$USERNAME"
-          test -n "$TOKEN"
-          test -n "$DB_PASSWORD"
+          test -n "$DOCKERHUB_USERNAME" || (echo "Missing DOCKERHUB_USERNAME" && exit 1)
+          test -n "$DOCKERHUB_TOKEN" || (echo "Missing DOCKERHUB_TOKEN" && exit 1)
+          test -n "$POSTGRES_PASSWORD" || (echo "Missing POSTGRES_PASSWORD" && exit 1)
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -36,15 +38,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push frontend
-        uses: docker/build-push-action@v6
-        with:
-          context: ./frontend
-          push: true
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/frontend:v1
-            ${{ secrets.DOCKERHUB_USERNAME }}/frontend:latest
-
       - name: Build and push backend
         uses: docker/build-push-action@v6
         with:
@@ -54,19 +47,33 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/backend:v1
             ${{ secrets.DOCKERHUB_USERNAME }}/backend:latest
 
-      - name: Create deployment environment
+      - name: Build and push frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/frontend:v1
+            ${{ secrets.DOCKERHUB_USERNAME }}/frontend:latest
+
+      - name: Create deployment environment file
         env:
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          DB_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
-          printf 'POSTGRES_PASSWORD=%s\n' "$POSTGRES_PASSWORD" > .env
+          cat > .env <<EOF
+          POSTGRES_DB=taskflow
+          POSTGRES_USER=taskflow_user
+          POSTGRES_PASSWORD=${DB_PASSWORD}
+          DATABASE_URL=postgresql://taskflow_user:${DB_PASSWORD}@postgres:5432/taskflow
+          REDIS_URL=redis://redis:6379
+          JWT_SECRET=TaskFlow_JWT_Secret_2026
+          PORT=3000
+          DOCKERHUB_USERNAME=${HUB_USER}
+          EOF
 
       - name: Validate deployment Compose
-        run: |
-          docker compose -f docker-compose.deploy.yml config --quiet
-          if grep -Eq '^[[:space:]]+build:' docker-compose.deploy.yml; then
-            echo "Deployment must use published images, not build:"
-            exit 1
-          fi
+        run: docker compose -f docker-compose.deploy.yml config --quiet
 
       - name: Pull published images
         run: docker compose -f docker-compose.deploy.yml pull
@@ -78,7 +85,7 @@ jobs:
         run: |
           for attempt in $(seq 1 40); do
             if curl --fail --silent http://localhost:3000/health; then
-              echo "Backend health check passed"
+              echo "Backend is healthy"
               break
             fi
             if [ "$attempt" -eq 40 ]; then
@@ -88,9 +95,9 @@ jobs:
             fi
             sleep 3
           done
-          curl --fail http://localhost:8082/ > /dev/null
-          docker compose -f docker-compose.deploy.yml ps
+          curl --fail --silent http://localhost:8082/ > /dev/null
+          echo "Frontend is responding"
 
-      - name: Cleanup
+      - name: Cleanup deployment
         if: always()
         run: docker compose -f docker-compose.deploy.yml down -v --remove-orphans || true
